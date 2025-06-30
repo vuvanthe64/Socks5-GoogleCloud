@@ -3,28 +3,24 @@
 # Dừng lại ngay nếu có lỗi
 set -e
 
-echo "=========================================================="
-echo "Bắt đầu cài đặt SOCKS5 Proxy với thông số ngẫu nhiên..."
-echo "=========================================================="
+echo "==================================================================="
+echo "Bắt đầu cài đặt SOCKS5 Proxy - Phiên bản Sửa lỗi (v2)..."
+echo "==================================================================="
 
 # 1. TẠO THÔNG SỐ NGẪU NHIÊN
-echo "[1/6] Đang tạo thông tin đăng nhập và port ngẫu nhiên..."
+echo "[1/5] Đang tạo thông tin đăng nhập và port ngẫu nhiên..."
 PROXY_USER="user$(head /dev/urandom | tr -dc a-z0-9 | head -c 6)"
 PROXY_PASS=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
-PROXY_PORT=$((RANDOM % 55535 + 10000)) # Port ngẫu nhiên từ 10000-65535
+PROXY_PORT=$((RANDOM % 55535 + 10000))
+FIREWALL_RULE_NAME="allow-socks-auto-$PROXY_PORT"
 echo "Đã tạo thông tin ngẫu nhiên."
 
-# 2. CÀI ĐẶT DANTE
-echo "[2/6] Đang cài đặt các gói cần thiết (dante-server)..."
+# 2. CÀI ĐẶT VÀ CẤU HÌNH DANTE
+echo "[2/5] Đang cài đặt và cấu hình dante-server..."
 sudo apt-get update > /dev/null
 sudo apt-get install dante-server -y > /dev/null
-echo "Cài đặt Dante hoàn tất."
-
-# 3. CẤU HÌNH DANTE
-echo "[3/6] Đang cấu hình Dante..."
 sudo useradd --shell /usr/sbin/nologin "$PROXY_USER" > /dev/null 2>&1 || true
 echo "$PROXY_USER:$PROXY_PASS" | sudo chpasswd
-
 INTERFACE=$(ip -o -4 route show to default | awk '{print $5}')
 sudo tee /etc/danted.conf > /dev/null <<EOF
 logoutput: syslog
@@ -38,43 +34,40 @@ socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
 EOF
 echo "Cấu hình Dante hoàn tất."
 
-# 4. KHỞI ĐỘNG DANTE
-echo "[4/6] Đang khởi động dịch vụ proxy..."
+# 3. KHỞI ĐỘNG DANTE
+echo "[3/5] Đang khởi động dịch vụ proxy..."
 sudo systemctl restart danted
 sudo systemctl enable danted > /dev/null
 echo "Dịch vụ đã khởi động."
 
-# 5. TỰ ĐỘNG MỞ FIREWALL (Yêu cầu gcloud và quyền)
-echo "[5/6] Đang cố gắng tự động mở Firewall trên Google Cloud..."
+# 4. TỰ ĐỘNG MỞ FIREWALL (Logic đơn giản hơn)
+echo "[4/5] Đang tự động mở Firewall trên Google Cloud..."
+# Cài đặt gcloud nếu chưa có
 if ! command -v gcloud &> /dev/null; then
     echo "gcloud CLI chưa được cài đặt. Đang tiến hành cài đặt..."
-    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list > /dev/null
     sudo apt-get install apt-transport-https ca-certificates gnupg -y > /dev/null
-    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key --keyring /usr/share/keyrings/cloud.google.gpg add - > /dev/null
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key --keyring /usr/share/keyrings/cloud.google.gpg add - > /dev/null 2>&1
     sudo apt-get update > /dev/null && sudo apt-get install google-cloud-cli -y > /dev/null
 fi
 
-FIREWALL_RULE_NAME="allow-socks-auto-$PROXY_PORT"
-NETWORK_TAGS=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/tags" -H "Metadata-Flavor: Google" | jq -r 'join(",")' 2>/dev/null)
+# Chạy lệnh tạo firewall trực tiếp, hiển thị lỗi nếu có
+gcloud compute firewall-rules create "$FIREWALL_RULE_NAME" \
+    --network=default \
+    --allow=tcp:$PROXY_PORT \
+    --source-ranges=0.0.0.0/0 \
+    --description="Auto-rule for SOCKS5 proxy on port $PROXY_PORT"
 
-# Lệnh tạo firewall
-FIREWALL_CMD="gcloud compute firewall-rules create $FIREWALL_RULE_NAME --allow tcp:$PROXY_PORT --description 'Auto-generated rule for SOCKS5' --direction INGRESS"
-
-# Thêm target-tags nếu có
-if [ -n "$NETWORK_TAGS" ] && [ "$NETWORK_TAGS" != "null" ]; then
-    FIREWALL_CMD="$FIREWALL_CMD --target-tags $NETWORK_TAGS"
-fi
-
-if $FIREWALL_CMD > /dev/null 2>&1; then
+# Kiểm tra xem lệnh gcloud có thành công không
+if [ $? -eq 0 ]; then
     echo "✅ TỰ ĐỘNG MỞ FIREWALL THÀNH CÔNG!"
 else
-    echo "❌ KHÔNG THỂ TỰ ĐỘNG MỞ FIREWALL."
-    echo "Lý do phổ biến nhất là do máy ảo chưa được cấp đủ quyền."
-    echo "Vui lòng làm theo hướng dẫn ở Bước 1 hoặc mở port $PROXY_PORT thủ công."
+    echo "❌ LỖI: Không thể tạo rule firewall. Vui lòng kiểm tra lại lỗi chi tiết ở trên."
+    exit 1
 fi
 
-# 6. HIỂN THỊ THÔNG TIN
-echo "[6/6] Hoàn tất quá trình."
+# 5. HIỂN THỊ THÔNG TIN
+echo "[5/5] Hoàn tất quá trình."
 EXTERNAL_IP=$(curl -s ifconfig.me)
 
 echo ""
