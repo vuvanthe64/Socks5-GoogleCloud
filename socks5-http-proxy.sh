@@ -1,120 +1,147 @@
 #!/bin/bash
-
-# Dừng lại ngay nếu có lỗi
 set -e
 
-echo "==================================================================="
-echo "Bắt đầu cài đặt song song SOCKS5 (Dante) & HTTP (Squid)..."
-echo "==================================================================="
+# ===================================================================
+# SCRIPT TẤT CẢ TRONG MỘT
+# Tự động cài đặt nền tảng nếu cần, và thêm proxy mới.
+# ===================================================================
 
-# 1. TẠO THÔNG SỐ NGẪU NHIÊN
-echo "[1/7] Đang tạo thông tin đăng nhập và port ngẫu nhiên..."
-PROXY_USER="user$(head /dev/urandom | tr -dc a-z0-9 | head -c 6)"
+# --- PHẦN 1: KIỂM TRA VÀ CÀI ĐẶT NỀN TẢNG (CHỈ CHẠY NẾU CẦN) ---
+
+# Kiểm tra xem file khuôn mẫu đã tồn tại chưa, nếu chưa thì tiến hành cài đặt.
+if [ ! -f "/etc/systemd/system/danted-inst@.service" ]; then
+    echo ">>> Lần chạy đầu tiên được phát hiện. Bắt đầu cài đặt nền tảng..."
+    echo "-------------------------------------------------------------------"
+    
+    # 1. Cài đặt các gói cần thiết
+    echo "[NỀN TẢNG] Cài đặt các gói: Dante, Squid, Apache Utils..."
+    export DEBIAN_FRONTEND=noninteractive
+    sudo apt-get update > /dev/null
+    sudo apt-get install dante-server squid apache2-utils -y > /dev/null
+
+    # 2. Tạo các thư mục cấu hình riêng biệt
+    echo "[NỀN TẢNG] Tạo các thư mục cấu hình riêng biệt..."
+    sudo mkdir -p /etc/dante/instances
+    sudo mkdir -p /etc/squid/instances
+    sudo mkdir -p /etc/squid/passwords
+
+    # 3. Vô hiệu hóa dịch vụ gốc để tránh xung đột
+    echo "[NỀN TẢNG] Vô hiệu hóa các dịch vụ gốc..."
+    sudo systemctl disable --now danted > /dev/null 2>&1 || true
+    sudo systemctl disable --now squid > /dev/null 2>&1 || true
+
+    # 4. Tạo file khuôn mẫu (template) cho dịch vụ
+    echo "[NỀN TẢNG] Tạo các file khuôn mẫu dịch vụ systemd..."
+    sudo tee /etc/systemd/system/danted-inst@.service > /dev/null <<'EOF'
+[Unit]
+Description=Dante SOCKS Proxy Instance %I
+After=network.target
+[Service]
+Type=forking
+ExecStart=/usr/sbin/danted -f /etc/dante/instances/danted-%i.conf -p /var/run/danted-%i.pid
+PIDFile=/var/run/danted-%i.pid
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo tee /etc/systemd/system/squid-inst@.service > /dev/null <<'EOF'
+[Unit]
+Description=Squid Proxy Instance %I
+After=network.target
+[Service]
+Type=forking
+ExecStartPre=/usr/sbin/squid -z -f /etc/squid/instances/squid-%i.conf
+ExecStart=/usr/sbin/squid -f /etc/squid/instances/squid-%i.conf
+PIDFile=/var/run/squid/squid-%i.pid
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 5. Nạp lại cấu hình systemd
+    sudo systemctl daemon-reload
+    echo "-------------------------------------------------------------------"
+    echo "✅ Cài đặt nền tảng hoàn tất. Giờ sẽ tạo cặp proxy đầu tiên."
+    echo "-------------------------------------------------------------------"
+fi
+
+# --- PHẦN 2: TẠO MỘT CẶP PROXY MỚI (LUÔN LUÔN CHẠY) ---
+
+echo ""
+echo ">>> Bắt đầu tạo một cặp Proxy mới..."
+
+# 1. Xác định ID cho instance mới
+INSTANCE_ID=$(($(ls -1 /etc/squid/instances/squid-*.conf 2>/dev/null | wc -l) + 1))
+echo "[1/5] Đây là cặp Proxy số: $INSTANCE_ID"
+
+# 2. Tạo thông số ngẫu nhiên cho instance này
+echo "[2/5] Đang tạo thông tin đăng nhập và port ngẫu nhiên..."
+PROXY_USER="user${INSTANCE_ID}_$(head /dev/urandom | tr -dc a-z0-9 | head -c 4)"
 PROXY_PASS=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
-SOCKS_PORT=$((RANDOM % 25000 + 10000))  # Port cho SOCKS5 (10000-34999)
-HTTP_PORT=$((RANDOM % 25000 + 40000))   # Port cho HTTP (40000-64999)
-echo "Đã tạo thông tin ngẫu nhiên."
+SOCKS_PORT=$((10000 + $INSTANCE_ID * 2))
+HTTP_PORT=$((40000 + $INSTANCE_ID * 2))
 
-# 2. CÀI ĐẶT CÁC GÓI CẦN THIẾT
-echo "[2/7] Đang cài đặt các gói cần thiết (Dante, Squid, Apache Utils)..."
-export DEBIAN_FRONTEND=noninteractive
-sudo apt-get update > /dev/null
-sudo apt-get install dante-server squid apache2-utils -y > /dev/null
-echo "Cài đặt hoàn tất."
-
-# 3. CẤU HÌNH USERNAME/PASSWORD CHUNG
-echo "[3/7] Đang tạo người dùng và mật khẩu chung..."
-# Tạo user cho Dante
-sudo useradd --shell /usr/sbin/nologin "$PROXY_USER" > /dev/null 2>&1 || true
-echo "$PROXY_USER:$PROXY_PASS" | sudo chpasswd
-# Tạo file mật khẩu cho Squid
-sudo htpasswd -cb /etc/squid/passwd "$PROXY_USER" "$PROXY_PASS" > /dev/null
-echo "Tạo mật khẩu chung hoàn tất."
-
-# 4. CẤU HÌNH SOCKS5 (DANTE)
-echo "[4/7] Đang cấu hình SOCKS5 trên port $SOCKS_PORT..."
-INTERFACE_DANTE=$(ip -o -4 route show to default | awk '{print $5}')
-sudo tee /etc/danted.conf > /dev/null <<EOF
+# 3. Tạo file cấu hình và mật khẩu riêng
+echo "[3/5] Đang tạo các file cấu hình riêng cho Instance #$INSTANCE_ID..."
+sudo htpasswd -cb /etc/squid/passwords/passwd-$INSTANCE_ID "$PROXY_USER" "$PROXY_PASS"
+sudo tee /etc/dante/instances/danted-$INSTANCE_ID.conf > /dev/null <<EOF
 logoutput: syslog
-internal: $INTERFACE_DANTE port = $SOCKS_PORT
-external: $INTERFACE_DANTE
+internal: $(ip -o -4 route show to default | awk '{print $5}') port = $SOCKS_PORT
+external: $(ip -o -4 route show to default | awk '{print $5}')
 method: username
 user.privileged: root
-user.notprivileged: nobody
+user.unprivileged: nobody
 client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
 socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
 EOF
-echo "Cấu hình Dante hoàn tất."
-
-# 5. CẤU HÌNH HTTP (SQUID)
-echo "[5/7] Đang cấu hình HTTP Proxy trên port $HTTP_PORT..."
-sudo mv /etc/squid/squid.conf /etc/squid/squid.conf.original > /dev/null 2>&1 || true
-sudo tee /etc/squid/squid.conf > /dev/null <<EOF
-# --- Cấu hình xác thực ---
-auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd
-auth_param basic realm "Squid Proxy"
+sudo tee /etc/squid/instances/squid-$INSTANCE_ID.conf > /dev/null <<EOF
+pid_filename /var/run/squid/squid-$INSTANCE_ID.pid
+auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwords/passwd-$INSTANCE_ID
+auth_param basic realm "Squid Proxy Instance $INSTANCE_ID"
 acl authenticated proxy_auth REQUIRED
-
-# --- Cấu hình truy cập ---
 http_access allow authenticated
 http_access deny all
 http_port $HTTP_PORT
-
-# --- Cấu hình ẩn danh (High Anonymity) ---
 via off
 forwarded_for off
-request_header_access From deny all
-request_header_access Server deny all
-request_header_access WWW-Authenticate deny all
-request_header_access Link deny all
-request_header_access X-Forwarded-For deny all
-request_header_access Via deny all
-request_header_access Cache-Control deny all
 EOF
-echo "Cấu hình Squid hoàn tất."
 
-# 6. KHỞI ĐỘNG CÁC DỊCH VỤ
-echo "[6/7] Đang khởi động và kích hoạt Dante & Squid..."
-sudo systemctl restart danted
-sudo systemctl enable danted > /dev/null
-sudo systemctl restart squid
-sudo systemctl enable squid > /dev/null
-echo "Các dịch vụ đã khởi động."
+# 4. Khởi động Instance dịch vụ mới
+echo "[4/5] Đang khởi động và kích hoạt Instance #$INSTANCE_ID..."
+sudo systemctl enable --now danted-inst@$INSTANCE_ID
+sudo systemctl enable --now squid-inst@$INSTANCE_ID
 
-# 7. TỰ ĐỘNG MỞ FIREWALL CHO CẢ 2 PORT
-echo "[7/7] Đang tự động mở 2 port ($SOCKS_PORT, $HTTP_PORT) trên Firewall..."
-# Cài đặt gcloud nếu chưa có
-if ! command -v gcloud &> /dev/null; then
-    echo "gcloud CLI chưa được cài đặt. Đang tiến hành cài đặt..."
-    sudo apt-get install apt-transport-https ca-certificates gnupg -y > /dev/null
-    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list > /dev/null
-    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key --keyring /usr/share/keyrings/cloud.google.gpg add - > /dev/null 2>&1
-    sudo apt-get update > /dev/null && sudo apt-get install google-cloud-cli -y > /dev/null
-fi
-
-FIREWALL_RULE_NAME="allow-proxies-auto-$(date +%s)"
-# Chạy lệnh tạo firewall, mở cả 2 port cùng lúc
+# 5. Mở Firewall cho các port mới
+echo "[5/5] Đang tự động mở port $SOCKS_PORT và $HTTP_PORT trên Firewall..."
+FIREWALL_RULE_NAME="allow-proxies-inst-$INSTANCE_ID"
+# Xóa rule cũ nếu có để tránh trùng lặp
+gcloud compute firewall-rules delete "$FIREWALL_RULE_NAME" --quiet > /dev/null 2>&1 || true
+# Tạo rule mới
 gcloud compute firewall-rules create "$FIREWALL_RULE_NAME" \
     --network=default \
     --allow=tcp:$SOCKS_PORT,tcp:$HTTP_PORT \
     --source-ranges=0.0.0.0/0 \
-    --description="Auto-rule for SOCKS5 and HTTP proxies"
+    --description="Rule for Proxy Instance #$INSTANCE_ID" > /dev/null 2>&1
 
 if [ $? -eq 0 ]; then
-    echo "✅ TỰ ĐỘNG MỞ FIREWALL THÀNH CÔNG!"
+    echo "✅ Tự động mở Firewall thành công!"
 else
-    echo "❌ LỖI: Không thể tạo rule firewall. Vui lòng kiểm tra lại lỗi chi tiết ở trên."
-    exit 1
+    echo "❌ LỖI: Không thể tạo rule firewall. Vui lòng kiểm tra quyền và mở thủ công."
 fi
 
-# HIỂN THỊ THÔNG TIN
+# Hiển thị thông tin
 EXTERNAL_IP=$(curl -s ifconfig.me)
 echo ""
 echo "=========================================================="
-echo "✅ CÀI ĐẶT SONG SONG HOÀN TẤT! ✅"
+echo "✅ ĐÃ TẠO THÀNH CÔNG PROXY INSTANCE #$INSTANCE_ID ✅"
 echo "=========================================================="
+echo "(Các proxy cũ của bạn vẫn đang hoạt động bình thường)"
 echo ""
-echo "--- [ SOCKS5 PROXY ] -----------------------------------"
+echo "--- [ SOCKS5 PROXY #$INSTANCE_ID ] --------------------------------"
 echo "IP Máy chủ      : $EXTERNAL_IP"
 echo "Port SOCKS5     : $SOCKS_PORT"
 echo "Username        : $PROXY_USER"
@@ -122,11 +149,10 @@ echo "Password        : $PROXY_PASS"
 echo "Chuỗi kết nối   : $PROXY_USER:$PROXY_PASS@$EXTERNAL_IP:$SOCKS_PORT"
 echo "--------------------------------------------------------"
 echo ""
-echo "--- [ HTTP PROXY ] -------------------------------------"
+echo "--- [ HTTP PROXY #$INSTANCE_ID ] ----------------------------------"
 echo "IP Máy chủ      : $EXTERNAL_IP"
 echo "Port HTTP       : $HTTP_PORT"
 echo "Username        : $PROXY_USER"
 echo "Password        : $PROXY_PASS"
 echo "Chuỗi kết nối   : http://$PROXY_USER:$PROXY_PASS@$EXTERNAL_IP:$HTTP_PORT"
 echo "--------------------------------------------------------"
-echo ""
