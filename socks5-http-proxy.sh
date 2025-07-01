@@ -1,9 +1,9 @@
 #!/bin/bash
-# Script All-in-One v9 - Dùng port ngẫu nhiên và tự động kiểm tra chống trùng lặp.
+# Script All-in-One v9 - Sửa lỗi cuối cùng cho Dante.
 set -e
 
 # --- Biến toàn cục ---
-SETUP_FLAG_FILE="/etc/multi_proxy_setup_complete_v8" # Dùng lại cờ của v8
+SETUP_FLAG_FILE="/etc/multi_proxy_setup_complete_v9"
 
 # --- PHẦN 1: KIỂM TRA VÀ CÀI ĐẶT/CẬP NHẬT NỀN TẢNG ---
 if [ ! -f "$SETUP_FLAG_FILE" ]; then
@@ -23,19 +23,23 @@ if [ ! -f "$SETUP_FLAG_FILE" ]; then
     sudo systemctl disable --now danted > /dev/null 2>&1 || true
     sudo systemctl disable --now squid > /dev/null 2>&1 || true
     # 1.4. Tạo file khuôn mẫu
-    echo "[SETUP 4/4] Tạo các file khuôn mẫu dịch vụ systemd..."
+    echo "[SETUP 4/4] Tạo các file khuôn mẫu dịch vụ systemd đã sửa lỗi..."
+    # Khuôn mẫu cho Dante (SOCKS5) - PHIÊN BẢN ĐÚNG
     sudo tee /etc/systemd/system/danted-inst@.service > /dev/null <<'EOF'
 [Unit]
 Description=Dante SOCKS Proxy Instance %I
 After=network.target
 [Service]
-Type=simple
-ExecStart=/usr/sbin/danted -N -f /etc/dante/instances/danted-%i.conf
+Type=forking
+RuntimeDirectory=dante
+PIDFile=/run/dante/danted-%i.pid
+ExecStart=/usr/sbin/danted -f /etc/dante/instances/danted-%i.conf -p /run/dante/danted-%i.pid
 Restart=always
 RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+    # Khuôn mẫu cho Squid (HTTP)
     sudo tee /etc/systemd/system/squid-inst@.service > /dev/null <<'EOF'
 [Unit]
 Description=Squid Proxy Instance %I
@@ -66,28 +70,19 @@ PROXY_USER="user${INSTANCE_ID}_$(head /dev/urandom | tr -dc a-z0-9 | head -c 4)"
 PROXY_PASS=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
 
 echo "[CREATE 2/6] Đang tìm kiếm port ngẫu nhiên còn trống..."
-# Vòng lặp tìm port SOCKS5 ngẫu nhiên và còn trống
 while true; do
     SOCKS_PORT=$((RANDOM % 55535 + 10000))
-    # Nếu lệnh 'ss' không tìm thấy port thì port đó còn trống -> thoát vòng lặp
-    if ! sudo ss -lntu | grep -q ":${SOCKS_PORT}\b"; then
-        break
-    fi
+    if ! sudo ss -lntu | grep -q ":${SOCKS_PORT}\b"; then break; fi
 done
-
-# Vòng lặp tìm port HTTP ngẫu nhiên, còn trống và không trùng port SOCKS5
 while true; do
     HTTP_PORT=$((RANDOM % 55535 + 10000))
-    if ! sudo ss -lntu | grep -q ":${HTTP_PORT}\b" && [ "$HTTP_PORT" -ne "$SOCKS_PORT" ]; then
-        break
-    fi
+    if ! sudo ss -lntu | grep -q ":${HTTP_PORT}\b" && [ "$HTTP_PORT" -ne "$SOCKS_PORT" ]; then break; fi
 done
 echo "Đã tìm thấy các port phù hợp: SOCKS5 ($SOCKS_PORT), HTTP ($HTTP_PORT)"
 
 echo "[CREATE 3/6] Đang tạo các file cấu hình riêng cho Instance #$INSTANCE_ID..."
 sudo htpasswd -cb /etc/squid/passwords/passwd-$INSTANCE_ID "$PROXY_USER" "$PROXY_PASS" > /dev/null
 INTERFACE=$(ip -o -4 route show to default | awk '{print $5}')
-# Cấu hình Dante
 sudo tee /etc/dante/instances/danted-$INSTANCE_ID.conf > /dev/null <<EOF
 logoutput: syslog
 internal: $INTERFACE port = $SOCKS_PORT
@@ -98,7 +93,6 @@ user.unprivileged: nobody
 client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
 socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
 EOF
-# Cấu hình Squid
 SQUID_CONF_PATH="/etc/squid/instances/squid-$INSTANCE_ID.conf"
 sudo tee "$SQUID_CONF_PATH" > /dev/null <<EOF
 auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwords/passwd-$INSTANCE_ID
@@ -134,7 +128,6 @@ echo ""
 echo "=========================================================="
 echo "✅ ĐÃ TẠO THÀNH CÔNG PROXY INSTANCE #$INSTANCE_ID ✅"
 echo "=========================================================="
-echo "(Các proxy cũ của bạn (nếu có) vẫn đang hoạt động bình thường)"
 echo ""
 echo "--- [ SOCKS5 PROXY #$INSTANCE_ID ] --------------------------------"
 echo "IP Máy chủ      : $EXTERNAL_IP"
