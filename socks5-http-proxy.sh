@@ -1,13 +1,13 @@
 #!/bin/bash
-# Script All-in-One v10 - Tăng cường sự ổn định khi khởi động dịch vụ.
+# Script All-in-One v11 - Chẩn đoán lỗi treo bằng cách bỏ xác thực SOCKS5.
 set -e
 
 # --- Biến toàn cục ---
-SETUP_FLAG_FILE="/etc/multi_proxy_setup_complete_v10"
+SETUP_FLAG_FILE="/etc/multi_proxy_setup_complete_v11"
 
-# --- PHẦN 1: KIỂM TRA VÀ CÀI ĐẶT NỀN TẢNG ---
+# --- PHẦN 1: KIỂM TRA VÀ CÀI ĐẶT/CẬP NHẬT NỀN TẢNG ---
 if [ ! -f "$SETUP_FLAG_FILE" ]; then
-    echo ">>> Lần chạy đầu tiên: Đang cài đặt nền tảng Multi-Proxy..."
+    echo ">>> Lần chạy đầu tiên (hoặc cần cập nhật): Đang cài đặt/cập nhật nền tảng..."
     echo "=========================================================="
     sleep 1
     echo "[SETUP 1/4] Cài đặt các gói..."
@@ -20,6 +20,7 @@ if [ ! -f "$SETUP_FLAG_FILE" ]; then
     sudo systemctl disable --now danted > /dev/null 2>&1 || true
     sudo systemctl disable --now squid > /dev/null 2>&1 || true
     echo "[SETUP 4/4] Tạo các file khuôn mẫu dịch vụ systemd..."
+    # Khuôn mẫu cho Dante (SOCKS5)
     sudo tee /etc/systemd/system/danted-inst@.service > /dev/null <<'EOF'
 [Unit]
 Description=Dante SOCKS Proxy Instance %I
@@ -34,6 +35,7 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+    # Khuôn mẫu cho Squid (HTTP)
     sudo tee /etc/systemd/system/squid-inst@.service > /dev/null <<'EOF'
 [Unit]
 Description=Squid Proxy Instance %I
@@ -51,7 +53,7 @@ EOF
     sudo systemctl daemon-reload
     sudo rm -f /etc/multi_proxy_setup_complete_*
     sudo touch "$SETUP_FLAG_FILE"
-    echo "✅ CÀI ĐẶT NỀN TẢNG HOÀN TẤT!"
+    echo "✅ CÀI ĐẶT/CẬP NHẬT NỀN TẢNG HOÀN TẤT!"
     echo "=========================================================="
 else
     echo ">>> Nền tảng đã ổn. Bắt đầu tạo proxy mới..."
@@ -72,16 +74,22 @@ echo "Đã tìm thấy các port phù hợp: SOCKS5 ($SOCKS_PORT), HTTP ($HTTP_P
 echo "[CREATE 3/6] Đang tạo các file cấu hình riêng cho Instance #$INSTANCE_ID..."
 sudo htpasswd -cb /etc/squid/passwords/passwd-$INSTANCE_ID "$PROXY_USER" "$PROXY_PASS" > /dev/null
 INTERFACE=$(ip -o -4 route show to default | awk '{print $5}')
+# --- THAY ĐỔI QUAN TRỌNG: Cấu hình Dante không cần xác thực ---
 sudo tee /etc/dante/instances/danted-$INSTANCE_ID.conf > /dev/null <<EOF
 logoutput: syslog
 internal: $INTERFACE port = $SOCKS_PORT
 external: $INTERFACE
-method: username
+
+# Không dùng xác thực username/password nữa, cho phép tất cả kết nối
+method: none
+
 user.privileged: root
 user.unprivileged: nobody
-client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
-socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 log: connect error }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 log: connect error }
 EOF
+# Cấu hình Squid vẫn có xác thực
 SQUID_CONF_PATH="/etc/squid/instances/squid-$INSTANCE_ID.conf"
 sudo tee "$SQUID_CONF_PATH" > /dev/null <<EOF
 auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwords/passwd-$INSTANCE_ID
@@ -98,13 +106,12 @@ echo "[CREATE 4/6] Đang khởi tạo cache cho Squid Instance #$INSTANCE_ID..."
 sudo /usr/sbin/squid -z -f "$SQUID_CONF_PATH" > /dev/null 2>&1 || echo "Squid cache đã tồn tại, bỏ qua."
 
 echo "[CREATE 5/6] Đang khởi động và kiểm tra dịch vụ..."
-# Tách riêng việc enable và start, sau đó chủ động kiểm tra
 services_to_start=("danted-inst@$INSTANCE_ID" "squid-inst@$INSTANCE_ID")
 for service in "${services_to_start[@]}"; do
     echo " - Kích hoạt và khởi động $service..."
     sudo systemctl enable "$service" > /dev/null
     sudo systemctl start "$service"
-    sleep 3 # Chờ 3 giây cho dịch vụ ổn định
+    sleep 3
     if ! sudo systemctl is-active --quiet "$service"; then
         echo "❌ LỖI: Dịch vụ $service đã không thể khởi động thành công."
         echo "--- Log chi tiết của dịch vụ ---"
@@ -130,15 +137,15 @@ echo "=========================================================="
 echo "✅ ĐÃ TẠO THÀNH CÔNG PROXY INSTANCE #$INSTANCE_ID ✅"
 echo "=========================================================="
 echo ""
-echo "--- [ SOCKS5 PROXY #$INSTANCE_ID ] --------------------------------"
+echo "--- [ SOCKS5 PROXY #$INSTANCE_ID (Không mật khẩu) ] -----------"
 echo "IP Máy chủ      : $EXTERNAL_IP"
 echo "Port SOCKS5     : $SOCKS_PORT"
-echo "Username        : $PROXY_USER"
-echo "Password        : $PROXY_PASS"
-echo "Chuỗi kết nối   : $PROXY_USER:$PROXY_PASS@$EXTERNAL_IP:$SOCKS_PORT"
+echo "Username        : (Không cần)"
+echo "Password        : (Không cần)"
+echo "Chuỗi kết nối   : $EXTERNAL_IP:$SOCKS_PORT"
 echo "--------------------------------------------------------"
 echo ""
-echo "--- [ HTTP PROXY #$INSTANCE_ID ] ----------------------------------"
+echo "--- [ HTTP PROXY #$INSTANCE_ID (Có mật khẩu) ] --------------"
 echo "IP Máy chủ      : $EXTERNAL_IP"
 echo "Port HTTP       : $HTTP_PORT"
 echo "Username        : $PROXY_USER"
