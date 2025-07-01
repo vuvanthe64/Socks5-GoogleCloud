@@ -1,30 +1,25 @@
 #!/bin/bash
-# Script All-in-One v9 - Sửa lỗi cuối cùng cho Dante.
+# Script All-in-One v10 - Tăng cường sự ổn định khi khởi động dịch vụ.
 set -e
 
 # --- Biến toàn cục ---
-SETUP_FLAG_FILE="/etc/multi_proxy_setup_complete_v9"
+SETUP_FLAG_FILE="/etc/multi_proxy_setup_complete_v10"
 
-# --- PHẦN 1: KIỂM TRA VÀ CÀI ĐẶT/CẬP NHẬT NỀN TẢNG ---
+# --- PHẦN 1: KIỂM TRA VÀ CÀI ĐẶT NỀN TẢNG ---
 if [ ! -f "$SETUP_FLAG_FILE" ]; then
-    echo ">>> Lần chạy đầu tiên (hoặc cần cập nhật): Đang cài đặt/cập nhật nền tảng..."
+    echo ">>> Lần chạy đầu tiên: Đang cài đặt nền tảng Multi-Proxy..."
     echo "=========================================================="
     sleep 1
-    # 1.1. Cài đặt các gói
     echo "[SETUP 1/4] Cài đặt các gói..."
     export DEBIAN_FRONTEND=noninteractive
     sudo apt-get update > /dev/null
     sudo apt-get install dante-server squid apache2-utils jq -y > /dev/null
-    # 1.2. Tạo thư mục
     echo "[SETUP 2/4] Tạo các thư mục cấu hình..."
     sudo mkdir -p /etc/dante/instances /etc/squid/instances /etc/squid/passwords
-    # 1.3. Vô hiệu hóa dịch vụ gốc
     echo "[SETUP 3/4] Vô hiệu hóa các dịch vụ gốc..."
     sudo systemctl disable --now danted > /dev/null 2>&1 || true
     sudo systemctl disable --now squid > /dev/null 2>&1 || true
-    # 1.4. Tạo file khuôn mẫu
-    echo "[SETUP 4/4] Tạo các file khuôn mẫu dịch vụ systemd đã sửa lỗi..."
-    # Khuôn mẫu cho Dante (SOCKS5) - PHIÊN BẢN ĐÚNG
+    echo "[SETUP 4/4] Tạo các file khuôn mẫu dịch vụ systemd..."
     sudo tee /etc/systemd/system/danted-inst@.service > /dev/null <<'EOF'
 [Unit]
 Description=Dante SOCKS Proxy Instance %I
@@ -39,13 +34,13 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-    # Khuôn mẫu cho Squid (HTTP)
     sudo tee /etc/systemd/system/squid-inst@.service > /dev/null <<'EOF'
 [Unit]
 Description=Squid Proxy Instance %I
 After=network.target
 [Service]
 Type=simple
+ExecStartPre=/usr/sbin/squid -z -f /etc/squid/instances/squid-%i.conf
 ExecStart=/usr/sbin/squid -N -f /etc/squid/instances/squid-%i.conf
 ExecReload=/usr/sbin/squid -k reconfigure -f /etc/squid/instances/squid-%i.conf
 Restart=always
@@ -56,7 +51,7 @@ EOF
     sudo systemctl daemon-reload
     sudo rm -f /etc/multi_proxy_setup_complete_*
     sudo touch "$SETUP_FLAG_FILE"
-    echo "✅ CÀI ĐẶT/CẬP NHẬT NỀN TẢNG HOÀN TẤT!"
+    echo "✅ CÀI ĐẶT NỀN TẢNG HOÀN TẤT!"
     echo "=========================================================="
 else
     echo ">>> Nền tảng đã ổn. Bắt đầu tạo proxy mới..."
@@ -70,14 +65,8 @@ PROXY_USER="user${INSTANCE_ID}_$(head /dev/urandom | tr -dc a-z0-9 | head -c 4)"
 PROXY_PASS=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
 
 echo "[CREATE 2/6] Đang tìm kiếm port ngẫu nhiên còn trống..."
-while true; do
-    SOCKS_PORT=$((RANDOM % 55535 + 10000))
-    if ! sudo ss -lntu | grep -q ":${SOCKS_PORT}\b"; then break; fi
-done
-while true; do
-    HTTP_PORT=$((RANDOM % 55535 + 10000))
-    if ! sudo ss -lntu | grep -q ":${HTTP_PORT}\b" && [ "$HTTP_PORT" -ne "$SOCKS_PORT" ]; then break; fi
-done
+while true; do SOCKS_PORT=$((RANDOM % 55535 + 10000)); if ! sudo ss -lntu | grep -q ":${SOCKS_PORT}\b"; then break; fi; done
+while true; do HTTP_PORT=$((RANDOM % 55535 + 10000)); if ! sudo ss -lntu | grep -q ":${HTTP_PORT}\b" && [ "$HTTP_PORT" -ne "$SOCKS_PORT" ]; then break; fi; done
 echo "Đã tìm thấy các port phù hợp: SOCKS5 ($SOCKS_PORT), HTTP ($HTTP_PORT)"
 
 echo "[CREATE 3/6] Đang tạo các file cấu hình riêng cho Instance #$INSTANCE_ID..."
@@ -108,18 +97,30 @@ EOF
 echo "[CREATE 4/6] Đang khởi tạo cache cho Squid Instance #$INSTANCE_ID..."
 sudo /usr/sbin/squid -z -f "$SQUID_CONF_PATH" > /dev/null 2>&1 || echo "Squid cache đã tồn tại, bỏ qua."
 
-echo "[CREATE 5/6] Đang khởi động và kích hoạt Instance #$INSTANCE_ID..."
-sudo systemctl enable --now danted-inst@$INSTANCE_ID
-sudo systemctl enable --now squid-inst@$INSTANCE_ID
+echo "[CREATE 5/6] Đang khởi động và kiểm tra dịch vụ..."
+# Tách riêng việc enable và start, sau đó chủ động kiểm tra
+services_to_start=("danted-inst@$INSTANCE_ID" "squid-inst@$INSTANCE_ID")
+for service in "${services_to_start[@]}"; do
+    echo " - Kích hoạt và khởi động $service..."
+    sudo systemctl enable "$service" > /dev/null
+    sudo systemctl start "$service"
+    sleep 3 # Chờ 3 giây cho dịch vụ ổn định
+    if ! sudo systemctl is-active --quiet "$service"; then
+        echo "❌ LỖI: Dịch vụ $service đã không thể khởi động thành công."
+        echo "--- Log chi tiết của dịch vụ ---"
+        sudo journalctl -u "$service" -n 20 --no-pager
+        echo "---------------------------------"
+        exit 1
+    fi
+done
+echo "Tất cả dịch vụ đã khởi động thành công."
 
 echo "[CREATE 6/6] Đang tự động mở port $SOCKS_PORT và $HTTP_PORT trên Firewall..."
 if ! command -v gcloud &> /dev/null; then sudo apt-get install google-cloud-cli -y > /dev/null; fi
 FIREWALL_RULE_NAME="allow-proxies-inst-$INSTANCE_ID"
 gcloud compute firewall-rules delete "$FIREWALL_RULE_NAME" --quiet > /dev/null 2>&1 || true
 gcloud compute firewall-rules create "$FIREWALL_RULE_NAME" \
-    --network=default \
-    --allow=tcp:$SOCKS_PORT,tcp:$HTTP_PORT \
-    --source-ranges=0.0.0.0/0 \
+    --network=default --allow=tcp:$SOCKS_PORT,tcp:$HTTP_PORT --source-ranges=0.0.0.0/0 \
     --description="Rule for Proxy Instance #$INSTANCE_ID" > /dev/null 2>&1 || true
 echo "Firewall đã được cấu hình."
 
